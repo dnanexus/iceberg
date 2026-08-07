@@ -365,6 +365,21 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
   @Override
   public boolean dropTable(TableIdentifier identifier, boolean purge) {
     try {
+      String databaseName = IcebergToGlueConverter.getDatabaseName(
+              identifier, awsProperties.glueCatalogSkipNameValidation());
+
+      GetTableResponse getTableResponse =
+              glue.getTable(
+                      GetTableRequest.builder()
+                              .catalogId(awsProperties.glueCatalogId())
+                              .databaseName(databaseName)
+                              .name(identifier.name())
+                              .build());
+      if (isGlueIcebergView(getTableResponse.table())) {
+        LOG.warn("dropTable({}) called but Glue table is an iceberg-view", identifier);
+        return false;
+      }
+
       TableOperations ops = newTableOps(identifier);
       TableMetadata lastMetadata = null;
       if (purge) {
@@ -380,9 +395,7 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
       glue.deleteTable(
           DeleteTableRequest.builder()
               .catalogId(awsProperties.glueCatalogId())
-              .databaseName(
-                  IcebergToGlueConverter.getDatabaseName(
-                      identifier, awsProperties.glueCatalogSkipNameValidation()))
+              .databaseName(databaseName)
               .name(identifier.name())
               .build());
       LOG.info("Successfully dropped table {} from Glue", identifier);
@@ -437,6 +450,10 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
     } catch (EntityNotFoundException e) {
       throw new NoSuchTableException(
           e, "Cannot rename %s because the table does not exist in Glue", from);
+    }
+
+    if (isGlueIcebergView(fromTable)) {
+      throw new NoSuchTableException("Cannot rename %s because it is not an Iceberg table in Glue", from);
     }
 
     // use the same Glue info to create the new table, pointing to the old metadata
