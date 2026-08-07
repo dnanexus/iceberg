@@ -622,7 +622,7 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
       if (fromView.parameters() == null
           || !ICEBERG_VIEW_TYPE_VALUE.equalsIgnoreCase(
               fromView.parameters().get(BaseMetastoreTableOperations.TABLE_TYPE_PROP))) {
-        throw new NoSuchTableException(
+        throw new NoSuchViewException(
             "Cannot rename %s because it is not an iceberg view in Glue (table_type != iceberg-view)",
             from);
       }
