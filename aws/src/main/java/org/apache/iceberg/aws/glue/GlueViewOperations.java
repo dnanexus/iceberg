@@ -116,6 +116,7 @@ public class GlueViewOperations extends BaseViewOperations {
       if (tableType.equalsIgnoreCase(GlueCatalog.ICEBERG_VIEW_TYPE_VALUE)) {
         metadataLocation = table.parameters().get("metadata_location");
       } else {
+        disableRefresh();
         return;
       }
     } else {

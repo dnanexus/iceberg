@@ -20,6 +20,7 @@ package org.apache.iceberg.aws.glue;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -36,6 +37,7 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.exceptions.NoSuchViewException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.inmemory.InMemoryFileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -854,6 +856,38 @@ public class TestGlueCatalog {
     boolean dropped = catalog.dropView(TableIdentifier.of("db", "drop_view_no_gc"));
     assertThat(dropped).isTrue();
     assertThat(io.fileExists(metadataLocation)).isTrue();
+  }
+
+  @Test
+  public void testLoadViewButItsNotIcebergView() {
+    TableIdentifier viewIdent = TableIdentifier.of("db", "foreign_view");
+    Table glueTable =
+        Table.builder()
+            .databaseName("db")
+            .name("foreign_view")
+            .tableType("VIRTUAL_VIEW")
+            // neither ICEBERG nor iceberg-view, e.g. an entity registered by another engine
+            .parameters(ImmutableMap.of("table_type", "DELTA"))
+            .build();
+
+    Mockito.doReturn(GetTableResponse.builder().table(glueTable).build())
+        .when(glue)
+        .getTable(Mockito.any(GetTableRequest.class));
+
+    Throwable thrown = catchThrowable(() -> glueCatalog.loadView(viewIdent));
+
+    // a foreign table_type must leave refresh disabled. otherwise refresh() ends by calling
+    // current(), which refreshes again because shouldRefresh was never cleared, and the two
+    // recurse until the stack is exhausted
+    assertThat(thrown)
+        .as("loadView must not recurse between current() and refresh()")
+        .isNotInstanceOf(StackOverflowError.class);
+    assertThat(thrown)
+        .isInstanceOf(NoSuchViewException.class)
+        .hasMessageContaining("View does not exist");
+
+    // one doRefresh means one Glue lookup: the recursion issues one per level instead
+    Mockito.verify(glue, Mockito.times(1)).getTable(Mockito.any(GetTableRequest.class));
   }
 
   @Test
