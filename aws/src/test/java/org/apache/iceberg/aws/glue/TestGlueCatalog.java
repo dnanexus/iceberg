@@ -35,6 +35,7 @@ import org.apache.iceberg.aws.s3.S3FileIOProperties;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
+import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.inmemory.InMemoryFileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -345,6 +346,28 @@ public class TestGlueCatalog {
   }
 
   @Test
+  public void testDropTableButItsView() {
+    TableIdentifier viewIdent = TableIdentifier.of("db", "as_view");
+    Table glueView =
+        Table.builder()
+            .databaseName("db")
+            .name("as_view")
+            .tableType("VIRTUAL_VIEW")
+            .parameters(ImmutableMap.of("table_type", "iceberg-view"))
+            .build();
+
+    Mockito.doReturn(GetTableResponse.builder().table(glueView).build())
+        .when(glue)
+        .getTable(Mockito.any(GetTableRequest.class));
+
+    // purge = false is the mode renameTable uses, purge = true is the Catalog default
+    assertThat(glueCatalog.dropTable(viewIdent, false)).isFalse();
+    assertThat(glueCatalog.dropTable(viewIdent)).isFalse();
+
+    Mockito.verify(glue, Mockito.never()).deleteTable(Mockito.any(DeleteTableRequest.class));
+  }
+
+  @Test
   public void testRenameTable() {
     AtomicInteger counter = new AtomicInteger(1);
     Map<String, String> properties = Maps.newHashMap();
@@ -377,6 +400,35 @@ public class TestGlueCatalog {
         .deleteTable(Mockito.any(DeleteTableRequest.class));
     glueCatalog.dropTable(TableIdentifier.of("db1", "t1"));
     assertThat(counter.get()).isEqualTo(0);
+  }
+
+  @Test
+  public void testRenameTableButItsView() {
+    TableIdentifier fromIdent = TableIdentifier.of("db", "as_view");
+    TableIdentifier toIdent = TableIdentifier.of("db", "renamed_view");
+    Table glueView =
+        Table.builder()
+            .databaseName("db")
+            .name("as_view")
+            .tableType("VIRTUAL_VIEW")
+            .parameters(ImmutableMap.of("table_type", "iceberg-view"))
+            .build();
+
+    Mockito.doReturn(
+            GetDatabaseResponse.builder().database(Database.builder().name("db").build()).build())
+        .when(glue)
+        .getDatabase(Mockito.any(GetDatabaseRequest.class));
+    Mockito.doReturn(GetTableResponse.builder().table(glueView).build())
+        .when(glue)
+        .getTable(Mockito.any(GetTableRequest.class));
+
+    assertThatThrownBy(() -> glueCatalog.renameTable(fromIdent, toIdent))
+        .isInstanceOf(NoSuchTableException.class)
+        .hasMessageContaining("is not an Iceberg table in Glue");
+
+    // the destination must not be created, otherwise two Glue entries share one metadata file
+    Mockito.verify(glue, Mockito.never()).createTable(Mockito.any(CreateTableRequest.class));
+    Mockito.verify(glue, Mockito.never()).deleteTable(Mockito.any(DeleteTableRequest.class));
   }
 
   @Test
