@@ -328,7 +328,7 @@ public class GlueViewOperations extends BaseViewOperations {
       commitStatus = CommitStatus.FAILURE;
     }
 
-    if (commitStatus != CommitStatus.SUCCESS && isAwsServiceException) {
+    if (commitStatus == CommitStatus.FAILURE && isAwsServiceException) {
       handleAwsExceptions((AwsServiceException) persistFailure);
     }
 
