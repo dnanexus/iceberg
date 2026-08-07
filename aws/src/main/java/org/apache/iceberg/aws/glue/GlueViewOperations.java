@@ -72,7 +72,7 @@ public class GlueViewOperations extends BaseViewOperations {
    * @param lockManager Lock manager
    * @param catalogName Catalog name
    * @param awsProperties AWS properties
-   * @param fileIO
+   * @param fileIO The {@link FileIO} instance to use
    * @param viewIdentifier View identifier
    */
   GlueViewOperations(
@@ -168,7 +168,13 @@ public class GlueViewOperations extends BaseViewOperations {
     } catch (AlreadyExistsException | CommitFailedException e) {
       throw e;
     } catch (RuntimeException e) {
-      commitStatus = handleCommitException(e, newMetadataLocation, retryDetector);
+      try {
+        commitStatus = handleCommitException(e, newMetadataLocation, metadata, retryDetector);
+      } catch (CommitStateUnknownException unknown) {
+        // the commit may still have succeeded, so the new metadata file must not be cleaned up
+        commitStatus = CommitStatus.UNKNOWN;
+        throw unknown;
+      }
     } finally {
       try {
         if (commitStatus == CommitStatus.FAILURE && newMetadataLocation != null) {
@@ -283,14 +289,20 @@ public class GlueViewOperations extends BaseViewOperations {
    *
    * @param persistFailure The runtime exception thrown during the commit sequence.
    * @param newMetadataLocation The newly created metadata location for this commit.
+   * @param metadata The view metadata being committed, used to read the commit status check retry
+   *     properties.
    * @param retryDetector Detects whether an AWS request was internally retried.
-   * @return A {@link CommitStatus} indicating SUCCESS or FAILURE.
+   * @return A {@link CommitStatus} indicating SUCCESS if the commit is determined to have
+   *     succeeded.
    * @throws CommitFailedException If the commit is determined to have failed definitively.
    * @throws CommitStateUnknownException If it cannot be determined whether the commit succeeded or
    *     failed.
    */
   private CommitStatus handleCommitException(
-      RuntimeException persistFailure, String newMetadataLocation, RetryDetector retryDetector) {
+      RuntimeException persistFailure,
+      String newMetadataLocation,
+      ViewMetadata metadata,
+      RetryDetector retryDetector) {
 
     LOG.error("Error during commit for view {}", fullViewName, persistFailure);
     boolean isAwsServiceException = persistFailure instanceof AwsServiceException;
@@ -298,7 +310,19 @@ public class GlueViewOperations extends BaseViewOperations {
 
     if (!isAwsServiceException || retryDetector.retried()) {
       LOG.warn("Validating if commit ended up succeeding for {}", fullViewName);
-      commitStatus = checkCommitStatus(newMetadataLocation);
+      commitStatus =
+          checkCommitStatus(
+              fullViewName,
+              newMetadataLocation,
+              metadata.properties(),
+              () -> {
+                Table table = getGlueTable();
+                return table != null
+                    && newMetadataLocation.equals(
+                        table
+                            .parameters()
+                            .get(BaseMetastoreTableOperations.METADATA_LOCATION_PROP));
+              });
     } else {
       commitStatus = CommitStatus.FAILURE;
     }
@@ -477,34 +501,6 @@ public class GlueViewOperations extends BaseViewOperations {
     }
 
     return closest != null ? closest.sql() : "";
-  }
-
-  /**
-   * Check the status of a commit.
-   *
-   * @param newMetadataLocation The new metadata location
-   * @return The commit status
-   */
-  private CommitStatus checkCommitStatus(String newMetadataLocation) {
-    try {
-      Table table = getGlueTable();
-
-      if (table == null) {
-        return CommitStatus.FAILURE;
-      }
-
-      String metadataLocation =
-          table.parameters().get(BaseMetastoreTableOperations.METADATA_LOCATION_PROP);
-
-      if (metadataLocation != null && metadataLocation.equals(newMetadataLocation)) {
-        return CommitStatus.SUCCESS;
-      } else {
-        return CommitStatus.FAILURE;
-      }
-    } catch (Exception e) {
-      LOG.error("Failed to check commit status for {}", fullViewName, e);
-      return CommitStatus.UNKNOWN;
-    }
   }
 
   /**
