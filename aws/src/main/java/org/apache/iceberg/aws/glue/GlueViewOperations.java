@@ -53,7 +53,7 @@ import software.amazon.awssdk.services.glue.model.TableInput;
 import software.amazon.awssdk.services.glue.model.UpdateTableRequest;
 
 /** Implementation of ViewOperations for AWS Glue Data Catalog. */
-public class GlueViewOperations extends BaseViewOperations implements AutoCloseable {
+public class GlueViewOperations extends BaseViewOperations {
   private static final Logger LOG = LoggerFactory.getLogger(GlueViewOperations.class);
 
   private final GlueClient glue;
@@ -72,8 +72,7 @@ public class GlueViewOperations extends BaseViewOperations implements AutoClosea
    * @param lockManager Lock manager
    * @param catalogName Catalog name
    * @param awsProperties AWS properties
-   * @param catalogProperties Catalog properties
-   * @param hadoopConf Hadoop configuration
+   * @param fileIO
    * @param viewIdentifier View identifier
    */
   GlueViewOperations(
@@ -81,8 +80,7 @@ public class GlueViewOperations extends BaseViewOperations implements AutoClosea
       LockManager lockManager,
       String catalogName,
       AwsProperties awsProperties,
-      Map<String, String> catalogProperties,
-      Object hadoopConf,
+      FileIO fileIO,
       TableIdentifier viewIdentifier) {
     this.glue = glue;
     this.lockManager = lockManager;
@@ -95,18 +93,7 @@ public class GlueViewOperations extends BaseViewOperations implements AutoClosea
             viewIdentifier, awsProperties.glueCatalogSkipNameValidation());
     this.fullViewName = String.format("%s.%s.%s", catalogName, databaseName, viewName);
     this.commitLockEntityId = String.format("%s.%s", databaseName, viewName);
-    this.fileIO = GlueTableOperations.initializeFileIO(catalogProperties, hadoopConf);
-  }
-
-  @Override
-  public void close() {
-    if (fileIO != null) {
-      try {
-        fileIO.close();
-      } catch (Exception e) {
-        LOG.error("Failed to close FileIO: {}", e.getMessage(), e);
-      }
-    }
+    this.fileIO = fileIO;
   }
 
   @Override

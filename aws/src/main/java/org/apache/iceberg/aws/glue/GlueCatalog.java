@@ -48,6 +48,7 @@ import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.hadoop.Configurable;
 import org.apache.iceberg.io.CloseableGroup;
+import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.FileIOTracker;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -100,6 +101,7 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
   private CloseableGroup closeableGroup;
   private Map<String, String> catalogProperties;
   private FileIOTracker fileIOTracker;
+  private FileIO fileIO;
   static final String ICEBERG_VIEW_TYPE_VALUE = "iceberg-view";
   static final String GLUE_VIRTUAL_VIEW_TYPE = "VIRTUAL_VIEW";
 
@@ -220,6 +222,11 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
     closeableGroup.addCloseable(metricsReporter());
     closeableGroup.addCloseable(fileIOTracker);
     closeableGroup.setSuppressCloseFailure(true);
+
+    this.fileIO =
+        GlueTableOperations.initializeFileIO(
+            catalogProperties == null ? ImmutableMap.of() : catalogProperties, hadoopConf);
+    closeableGroup.addCloseable(fileIO);
   }
 
   @Override
@@ -487,17 +494,8 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
 
   @Override
   protected ViewOperations newViewOps(TableIdentifier viewIdentifier) {
-    Map<String, String> effectiveProperties =
-        catalogProperties == null ? ImmutableMap.of() : ImmutableMap.copyOf(catalogProperties);
-
     return new GlueViewOperations(
-        glue,
-        lockManager,
-        catalogName,
-        awsProperties,
-        effectiveProperties,
-        hadoopConf,
-        viewIdentifier);
+        glue, lockManager, catalogName, awsProperties, fileIO, viewIdentifier);
   }
 
   private boolean isGlueIcebergView(Table table) {
@@ -534,28 +532,26 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
 
       // the Glue entry only holds a pointer to the view metadata file, so the metadata has to be
       // loaded before the entry is removed in order to be able to clean the file up afterwards
-      try (GlueViewOperations ops = (GlueViewOperations) newViewOps(identifier)) {
-        ViewMetadata lastViewMetadata = null;
-        try {
-          lastViewMetadata = ops.current();
-        } catch (RuntimeException e) {
-          LOG.warn("Failed to load view metadata for view: {}", identifier, e);
-        }
-
-        glue.deleteTable(
-            DeleteTableRequest.builder()
-                .catalogId(awsProperties.glueCatalogId())
-                .databaseName(dbName)
-                .name(tblName)
-                .build());
-        LOG.info("Successfully dropped view {} from Glue", identifier);
-
-        if (lastViewMetadata != null) {
-          CatalogUtil.dropViewMetadata(ops.io(), lastViewMetadata);
-        }
-
-        return true;
+      ViewMetadata lastViewMetadata = null;
+      try {
+        lastViewMetadata = newViewOps(identifier).current();
+      } catch (RuntimeException e) {
+        LOG.warn("Failed to load view metadata for view: {}", identifier, e);
       }
+
+      glue.deleteTable(
+          DeleteTableRequest.builder()
+              .catalogId(awsProperties.glueCatalogId())
+              .databaseName(dbName)
+              .name(tblName)
+              .build());
+      LOG.info("Successfully dropped view {} from Glue", identifier);
+
+      if (lastViewMetadata != null) {
+        CatalogUtil.dropViewMetadata(fileIO, lastViewMetadata);
+      }
+
+      return true;
 
     } catch (EntityNotFoundException e) {
       LOG.warn("Cannot dropView({}), table not found in Glue", identifier, e);
