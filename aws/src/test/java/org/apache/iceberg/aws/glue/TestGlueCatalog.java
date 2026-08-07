@@ -21,23 +21,33 @@ package org.apache.iceberg.aws.glue;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.BaseMetastoreTableOperations;
+import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.aws.AwsProperties;
 import org.apache.iceberg.aws.s3.S3FileIOProperties;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.inmemory.InMemoryFileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.LockManagers;
+import org.apache.iceberg.view.ImmutableSQLViewRepresentation;
+import org.apache.iceberg.view.ImmutableViewVersion;
+import org.apache.iceberg.view.ViewMetadata;
+import org.apache.iceberg.view.ViewMetadataParser;
+import org.apache.iceberg.view.ViewVersion;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
@@ -705,6 +715,8 @@ public class TestGlueCatalog {
 
   @Test
   public void testDropView() {
+    // the metadata file is not present in the FileIO, the view must still be dropped
+    GlueCatalog catalog = glueCatalogWithInMemoryFileIO();
     TableIdentifier viewIdent = TableIdentifier.of("db", "drop_view");
     Table glueView =
         Table.builder()
@@ -713,7 +725,10 @@ public class TestGlueCatalog {
             .tableType("VIRTUAL_VIEW")
             .parameters(
                 ImmutableMap.of(
-                    "table_type", "iceberg-view", "metadata_location", "s3://xx/metadata.json"))
+                    "table_type",
+                    "iceberg-view",
+                    "metadata_location",
+                    WAREHOUSE_PATH + "/db/drop_view/metadata/00001-missing.metadata.json"))
             .build();
 
     Mockito.doReturn(GetTableResponse.builder().table(glueView).build())
@@ -723,7 +738,7 @@ public class TestGlueCatalog {
         .when(glue)
         .deleteTable(Mockito.any(DeleteTableRequest.class));
 
-    boolean dropped = glueCatalog.dropView(viewIdent);
+    boolean dropped = catalog.dropView(viewIdent);
     assertThat(dropped).isTrue();
 
     Mockito.verify(glue, Mockito.times(1))
@@ -731,6 +746,62 @@ public class TestGlueCatalog {
             Mockito.argThat(
                 (DeleteTableRequest r) ->
                     r.databaseName().equals("db") && r.name().equals("drop_view")));
+  }
+
+  @Test
+  public void testDropViewDeletesMetadataFile() {
+    GlueCatalog catalog = glueCatalogWithInMemoryFileIO();
+    InMemoryFileIO io = new InMemoryFileIO();
+    String metadataLocation = writeViewMetadata(io, "drop_view_gc", ImmutableMap.of());
+    Table glueView =
+        Table.builder()
+            .databaseName("db")
+            .name("drop_view_gc")
+            .tableType("VIRTUAL_VIEW")
+            .parameters(
+                ImmutableMap.of(
+                    "table_type", "iceberg-view", "metadata_location", metadataLocation))
+            .build();
+
+    Mockito.doReturn(GetTableResponse.builder().table(glueView).build())
+        .when(glue)
+        .getTable(Mockito.any(GetTableRequest.class));
+    Mockito.doReturn(DeleteTableResponse.builder().build())
+        .when(glue)
+        .deleteTable(Mockito.any(DeleteTableRequest.class));
+
+    boolean dropped = catalog.dropView(TableIdentifier.of("db", "drop_view_gc"));
+    assertThat(dropped).isTrue();
+    assertThat(io.fileExists(metadataLocation)).isFalse();
+  }
+
+  @Test
+  public void testDropViewKeepsMetadataFileWhenGcDisabled() {
+    GlueCatalog catalog = glueCatalogWithInMemoryFileIO();
+    InMemoryFileIO io = new InMemoryFileIO();
+    String metadataLocation =
+        writeViewMetadata(
+            io, "drop_view_no_gc", ImmutableMap.of(TableProperties.GC_ENABLED, "false"));
+    Table glueView =
+        Table.builder()
+            .databaseName("db")
+            .name("drop_view_no_gc")
+            .tableType("VIRTUAL_VIEW")
+            .parameters(
+                ImmutableMap.of(
+                    "table_type", "iceberg-view", "metadata_location", metadataLocation))
+            .build();
+
+    Mockito.doReturn(GetTableResponse.builder().table(glueView).build())
+        .when(glue)
+        .getTable(Mockito.any(GetTableRequest.class));
+    Mockito.doReturn(DeleteTableResponse.builder().build())
+        .when(glue)
+        .deleteTable(Mockito.any(DeleteTableRequest.class));
+
+    boolean dropped = catalog.dropView(TableIdentifier.of("db", "drop_view_no_gc"));
+    assertThat(dropped).isTrue();
+    assertThat(io.fileExists(metadataLocation)).isTrue();
   }
 
   @Test
@@ -836,5 +907,101 @@ public class TestGlueCatalog {
                         && "iceberg-view".equals(r.tableInput().parameters().get("table_type"))));
     Mockito.verify(glue, Mockito.times(1))
         .deleteTable(Mockito.argThat((DeleteTableRequest r) -> r.name().equals("old_view")));
+  }
+
+  @Test
+  public void testRenameViewKeepsMetadataFile() {
+    // the renamed view points at the metadata file of the source, so it must not be deleted
+    GlueCatalog catalog = glueCatalogWithInMemoryFileIO();
+    InMemoryFileIO io = new InMemoryFileIO();
+    String metadataLocation = writeViewMetadata(io, "rename_view", ImmutableMap.of());
+
+    Mockito.doReturn(
+            GetDatabaseResponse.builder().database(Database.builder().name("db").build()).build())
+        .when(glue)
+        .getDatabase(Mockito.any(GetDatabaseRequest.class));
+
+    Table existingView =
+        Table.builder()
+            .databaseName("db")
+            .name("rename_view")
+            .tableType("VIRTUAL_VIEW")
+            .parameters(
+                ImmutableMap.of(
+                    "table_type", "iceberg-view", "metadata_location", metadataLocation))
+            .build();
+    Mockito.doReturn(GetTableResponse.builder().table(existingView).build())
+        .when(glue)
+        .getTable(Mockito.<GetTableRequest>argThat(r -> "rename_view".equals(r.name())));
+    Mockito.doThrow(EntityNotFoundException.builder().build())
+        .when(glue)
+        .getTable(Mockito.<GetTableRequest>argThat(r -> "renamed_view".equals(r.name())));
+    Mockito.doReturn(CreateTableResponse.builder().build())
+        .when(glue)
+        .createTable(Mockito.any(CreateTableRequest.class));
+    Mockito.doReturn(DeleteTableResponse.builder().build())
+        .when(glue)
+        .deleteTable(Mockito.any(DeleteTableRequest.class));
+
+    catalog.renameView(
+        TableIdentifier.of("db", "rename_view"), TableIdentifier.of("db", "renamed_view"));
+
+    Mockito.verify(glue, Mockito.times(1))
+        .deleteTable(Mockito.argThat((DeleteTableRequest r) -> r.name().equals("rename_view")));
+    // the destination must not be rolled back
+    Mockito.verify(glue, Mockito.never())
+        .deleteTable(Mockito.argThat((DeleteTableRequest r) -> r.name().equals("renamed_view")));
+    assertThat(io.fileExists(metadataLocation)).isTrue();
+  }
+
+  private GlueCatalog glueCatalogWithInMemoryFileIO() {
+    GlueCatalog catalog = new GlueCatalog();
+    catalog.initialize(
+        CATALOG_NAME,
+        WAREHOUSE_PATH,
+        new AwsProperties(),
+        new S3FileIOProperties(),
+        glue,
+        LockManagers.defaultLockManager(),
+        ImmutableMap.of(CatalogProperties.FILE_IO_IMPL, InMemoryFileIO.class.getName()));
+    return catalog;
+  }
+
+  /**
+   * Writes view metadata for the given view into the in-memory FileIO and returns its location.
+   * Locations are derived from the view name and a random UUID because {@link InMemoryFileIO}
+   * shares its files between all instances.
+   */
+  private String writeViewMetadata(
+      InMemoryFileIO io, String viewName, Map<String, String> properties) {
+    ViewVersion version =
+        ImmutableViewVersion.builder()
+            .versionId(1)
+            .timestampMillis(1234L)
+            .schemaId(0)
+            .defaultCatalog(CATALOG_NAME)
+            .defaultNamespace(Namespace.of("db"))
+            .addRepresentations(
+                ImmutableSQLViewRepresentation.builder()
+                    .sql("select 1 id")
+                    .dialect("spark")
+                    .build())
+            .build();
+    ViewMetadata metadata =
+        ViewMetadata.builder()
+            .addSchema(new Schema(Types.NestedField.required(1, "id", Types.LongType.get())))
+            .addVersion(version)
+            .setLocation(String.format("%s/db/%s", WAREHOUSE_PATH, viewName))
+            .setProperties(properties)
+            .setCurrentVersionId(1)
+            .upgradeFormatVersion(1)
+            .build();
+    String metadataLocation =
+        String.format(
+            "%s/db/%s/metadata/00001-%s.metadata.json",
+            WAREHOUSE_PATH, viewName, UUID.randomUUID());
+    io.addFile(
+        metadataLocation, ViewMetadataParser.toJson(metadata).getBytes(StandardCharsets.UTF_8));
+    return metadataLocation;
   }
 }
