@@ -60,6 +60,7 @@ import org.apache.iceberg.util.LockManagers;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.view.BaseMetastoreViewCatalog;
 import org.apache.iceberg.view.ViewBuilder;
+import org.apache.iceberg.view.ViewMetadata;
 import org.apache.iceberg.view.ViewOperations;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -531,15 +532,30 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
         return false;
       }
 
-      glue.deleteTable(
-          DeleteTableRequest.builder()
-              .catalogId(awsProperties.glueCatalogId())
-              .databaseName(dbName)
-              .name(tblName)
-              .build());
-      LOG.info("Successfully dropped view {} from Glue", identifier);
+      // the Glue entry only holds a pointer to the view metadata file, so the metadata has to be
+      // loaded before the entry is removed in order to be able to clean the file up afterwards
+      try (GlueViewOperations ops = (GlueViewOperations) newViewOps(identifier)) {
+        ViewMetadata lastViewMetadata = null;
+        try {
+          lastViewMetadata = ops.current();
+        } catch (RuntimeException e) {
+          LOG.warn("Failed to load view metadata for view: {}", identifier, e);
+        }
 
-      return true;
+        glue.deleteTable(
+            DeleteTableRequest.builder()
+                .catalogId(awsProperties.glueCatalogId())
+                .databaseName(dbName)
+                .name(tblName)
+                .build());
+        LOG.info("Successfully dropped view {} from Glue", identifier);
+
+        if (lastViewMetadata != null) {
+          CatalogUtil.dropViewMetadata(ops.io(), lastViewMetadata);
+        }
+
+        return true;
+      }
 
     } catch (EntityNotFoundException e) {
       LOG.warn("Cannot dropView({}), table not found in Glue", identifier, e);
@@ -656,7 +672,15 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
     }
 
     try {
-      dropView(from);
+      // Delete the table in Glue and keep metadata file.
+      glue.deleteTable(
+          DeleteTableRequest.builder()
+              .catalogId(awsProperties.glueCatalogId())
+              .databaseName(fromTableDbName)
+              .name(fromTableName)
+              .build());
+    } catch (EntityNotFoundException e) {
+      LOG.warn("Old view {} was already gone after renaming to {}", from, to, e);
     } catch (Exception e) {
       LOG.error("Failed to drop old view {} after renaming to {}, rolling back...", from, to, e);
       glue.deleteTable(
