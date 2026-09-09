@@ -103,6 +103,15 @@ class TestLakeFormationCredentialsProvider {
   }
 
   @Test
+  void closesLakeFormationClient() {
+    LakeFormationClient client = mock(LakeFormationClient.class);
+
+    new LakeFormationCredentialsProvider(client, TABLE_ARN).close();
+
+    verify(client).close();
+  }
+
+  @Test
   void requestsColumnPermissionCredentials() {
     LakeFormationClient client = mock(LakeFormationClient.class);
     Instant expiresAt = Instant.now().plus(1, ChronoUnit.HOURS);

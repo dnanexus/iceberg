@@ -172,6 +172,7 @@ public class LakeFormationAwsClientFactory extends AssumeRoleAwsClientFactory {
     @Override
     public void close() {
       IoUtils.closeQuietlyV2(credentialCache, null);
+      IoUtils.closeQuietlyV2(client, null);
     }
 
     private RefreshResult<AwsCredentials> refreshCredential() {
