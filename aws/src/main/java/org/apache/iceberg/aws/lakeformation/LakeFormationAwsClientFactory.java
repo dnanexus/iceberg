@@ -18,6 +18,8 @@
  */
 package org.apache.iceberg.aws.lakeformation;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Map;
 import org.apache.iceberg.aws.AssumeRoleAwsClientFactory;
 import org.apache.iceberg.aws.AwsProperties;
@@ -35,6 +37,10 @@ import software.amazon.awssdk.services.lakeformation.model.GetTemporaryGlueTable
 import software.amazon.awssdk.services.lakeformation.model.GetTemporaryGlueTableCredentialsResponse;
 import software.amazon.awssdk.services.lakeformation.model.PermissionType;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.utils.IoUtils;
+import software.amazon.awssdk.utils.SdkAutoCloseable;
+import software.amazon.awssdk.utils.cache.CachedSupplier;
+import software.amazon.awssdk.utils.cache.RefreshResult;
 
 /**
  * This implementation of AwsClientFactory is used by default if {@link
@@ -141,29 +147,68 @@ public class LakeFormationAwsClientFactory extends AssumeRoleAwsClientFactory {
         .build();
   }
 
-  static class LakeFormationCredentialsProvider implements AwsCredentialsProvider {
+  static class LakeFormationCredentialsProvider
+      implements AwsCredentialsProvider, SdkAutoCloseable {
+    private static final Duration PREFETCH_BEFORE_EXPIRY = Duration.ofMinutes(5);
+
     private final LakeFormationClient client;
     private final String tableArn;
+    private final CachedSupplier<AwsCredentials> credentialCache;
 
     LakeFormationCredentialsProvider(LakeFormationClient lakeFormationClient, String tableArn) {
       this.client = lakeFormationClient;
       this.tableArn = tableArn;
+      this.credentialCache =
+          CachedSupplier.builder(this::refreshCredential)
+              .cachedValueName(LakeFormationCredentialsProvider.class.getName())
+              .build();
     }
 
     @Override
     public AwsCredentials resolveCredentials() {
-      GetTemporaryGlueTableCredentialsRequest getTemporaryGlueTableCredentialsRequest =
-          GetTemporaryGlueTableCredentialsRequest.builder()
-              .tableArn(tableArn)
-              // Now only two permission types (COLUMN_PERMISSION and CELL_FILTER_PERMISSION) are
-              // supported
-              // and Iceberg only supports COLUMN_PERMISSION at this time
-              .supportedPermissionTypes(PermissionType.COLUMN_PERMISSION)
-              .build();
+      return credentialCache.get();
+    }
+
+    @Override
+    public void close() {
+      IoUtils.closeQuietlyV2(credentialCache, null);
+      IoUtils.closeQuietlyV2(client, null);
+    }
+
+    private RefreshResult<AwsCredentials> refreshCredential() {
       GetTemporaryGlueTableCredentialsResponse response =
-          client.getTemporaryGlueTableCredentials(getTemporaryGlueTableCredentialsRequest);
-      return AwsSessionCredentials.create(
-          response.accessKeyId(), response.secretAccessKey(), response.sessionToken());
+          client.getTemporaryGlueTableCredentials(
+              GetTemporaryGlueTableCredentialsRequest.builder()
+                  .tableArn(tableArn)
+                  // Now only two permission types (COLUMN_PERMISSION and CELL_FILTER_PERMISSION)
+                  // are supported and Iceberg only supports COLUMN_PERMISSION at this time
+                  .supportedPermissionTypes(PermissionType.COLUMN_PERMISSION)
+                  .build());
+      Instant expiresAt = requireExpiration(response);
+      Instant prefetchAt = expiresAt.minus(PREFETCH_BEFORE_EXPIRY);
+      Preconditions.checkState(
+          prefetchAt.isAfter(Instant.now()),
+          "Invalid Lake Formation credentials: expire at %s, too soon to cache",
+          expiresAt);
+
+      return RefreshResult.builder(
+              (AwsCredentials)
+                  AwsSessionCredentials.builder()
+                      .accessKeyId(response.accessKeyId())
+                      .secretAccessKey(response.secretAccessKey())
+                      .sessionToken(response.sessionToken())
+                      .expirationTime(expiresAt)
+                      .build())
+          .staleTime(expiresAt)
+          .prefetchTime(prefetchAt)
+          .build();
+    }
+
+    private static Instant requireExpiration(GetTemporaryGlueTableCredentialsResponse response) {
+      Instant expiresAt = response.expiration();
+      Preconditions.checkState(
+          expiresAt != null, "Invalid Lake Formation credentials: expiration not set");
+      return expiresAt;
     }
   }
 }
