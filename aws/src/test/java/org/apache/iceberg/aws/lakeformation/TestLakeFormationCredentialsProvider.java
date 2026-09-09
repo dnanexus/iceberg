@@ -64,26 +64,42 @@ class TestLakeFormationCredentialsProvider {
   }
 
   @Test
-  void refreshesExpiredCredentials() {
+  void expiredCredentialsFail() {
     LakeFormationClient client = mock(LakeFormationClient.class);
     Instant expiredAt = Instant.now().minus(1, ChronoUnit.MINUTES);
-    Instant refreshedExpiresAt = Instant.now().plus(1, ChronoUnit.HOURS);
     when(client.getTemporaryGlueTableCredentials(
             any(GetTemporaryGlueTableCredentialsRequest.class)))
-        .thenReturn(credentialsResponse("key-1", "secret-1", "token-1", expiredAt))
-        .thenReturn(credentialsResponse("key-2", "secret-2", "token-2", refreshedExpiresAt));
+        .thenReturn(credentialsResponse("key-1", "secret-1", "token-1", expiredAt));
 
     try (LakeFormationCredentialsProvider provider =
         new LakeFormationCredentialsProvider(client, TABLE_ARN)) {
-      AwsCredentials first = provider.resolveCredentials();
-      assertSessionCredentials(first, "key-1", "secret-1", "token-1", expiredAt);
-
-      AwsCredentials refreshed = provider.resolveCredentials();
-      assertThat(refreshed).isNotSameAs(first);
-      assertSessionCredentials(refreshed, "key-2", "secret-2", "token-2", refreshedExpiresAt);
+      assertThatThrownBy(provider::resolveCredentials)
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("Invalid Lake Formation credentials: expire at")
+          .hasMessageContaining("too soon to cache");
     }
 
-    verify(client, times(2))
+    verify(client, times(1))
+        .getTemporaryGlueTableCredentials(any(GetTemporaryGlueTableCredentialsRequest.class));
+  }
+
+  @Test
+  void credentialsExpiringWithinPrefetchWindowFail() {
+    LakeFormationClient client = mock(LakeFormationClient.class);
+    Instant nearExpiry = Instant.now().plus(2, ChronoUnit.MINUTES);
+    when(client.getTemporaryGlueTableCredentials(
+            any(GetTemporaryGlueTableCredentialsRequest.class)))
+        .thenReturn(credentialsResponse("key-1", "secret-1", "token-1", nearExpiry));
+
+    try (LakeFormationCredentialsProvider provider =
+        new LakeFormationCredentialsProvider(client, TABLE_ARN)) {
+      assertThatThrownBy(provider::resolveCredentials)
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("Invalid Lake Formation credentials: expire at")
+          .hasMessageContaining("too soon to cache");
+    }
+
+    verify(client, times(1))
         .getTemporaryGlueTableCredentials(any(GetTemporaryGlueTableCredentialsRequest.class));
   }
 
