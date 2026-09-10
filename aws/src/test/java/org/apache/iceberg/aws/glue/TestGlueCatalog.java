@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -765,6 +766,62 @@ public class TestGlueCatalog {
             S3FileIOProperties.WRITE_TAGS_PREFIX.concat(
                 S3FileIOProperties.S3_TAG_ICEBERG_NAMESPACE),
             "db");
+  }
+
+  @Test
+  public void testViewLevelLakeFormationProperties() {
+    Map<String, String> properties =
+        ImmutableMap.of(
+            AwsProperties.GLUE_LAKEFORMATION_ENABLED,
+            "true",
+            CatalogProperties.FILE_IO_IMPL,
+            InMemoryFileIO.class.getName());
+    glueCatalog.initialize(
+        CATALOG_NAME,
+        WAREHOUSE_PATH,
+        new AwsProperties(properties),
+        new S3FileIOProperties(properties),
+        glue,
+        LockManagers.defaultLockManager(),
+        properties);
+
+    assertThat(
+            glueCatalog.viewSpecificCatalogProperties(
+                TableIdentifier.of(Namespace.of("db"), "view")))
+        .containsEntry(AwsProperties.LAKE_FORMATION_DB_NAME, "db")
+        .containsEntry(AwsProperties.LAKE_FORMATION_TABLE_NAME, "view")
+        .containsEntry(S3FileIOProperties.PRELOAD_CLIENT_ENABLED, "true");
+  }
+
+  @Test
+  public void testViewLevelPropertiesWithoutLakeFormation() {
+    GlueCatalog catalog = glueCatalogWithInMemoryFileIO();
+
+    assertThat(
+            catalog.viewSpecificCatalogProperties(TableIdentifier.of(Namespace.of("db"), "view")))
+        .doesNotContainKey(AwsProperties.LAKE_FORMATION_DB_NAME)
+        .doesNotContainKey(AwsProperties.LAKE_FORMATION_TABLE_NAME)
+        .doesNotContainKey(S3FileIOProperties.PRELOAD_CLIENT_ENABLED)
+        .containsEntry(CatalogProperties.FILE_IO_IMPL, InMemoryFileIO.class.getName());
+  }
+
+  @Test
+  public void testViewFileIOCachedPerIdentifier() throws IOException {
+    GlueCatalog catalog = glueCatalogWithInMemoryFileIO();
+    TableIdentifier view1 = TableIdentifier.of(Namespace.of("db"), "view1");
+    TableIdentifier view2 = TableIdentifier.of(Namespace.of("db"), "view2");
+    GlueViewOperations ops1a = (GlueViewOperations) catalog.newViewOps(view1);
+    GlueViewOperations ops1b = (GlueViewOperations) catalog.newViewOps(view1);
+    GlueViewOperations ops2 = (GlueViewOperations) catalog.newViewOps(view2);
+
+    // repeated loads of the same view reuse one FileIO, while distinct views get their own so
+    // that view-specific properties (e.g. LakeFormation db/table name) can differ between views
+    assertThat(ops1a.io()).isSameAs(ops1b.io());
+    assertThat(ops1a.io()).isNotSameAs(ops2.io());
+    assertThat(catalog.viewFileIOByIdentifier()).hasSize(2);
+
+    catalog.close();
+    assertThat(catalog.viewFileIOByIdentifier()).isEmpty();
   }
 
   @Test
