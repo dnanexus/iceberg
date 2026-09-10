@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.aws.glue;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
@@ -101,7 +102,7 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
   private CloseableGroup closeableGroup;
   private Map<String, String> catalogProperties;
   private FileIOTracker fileIOTracker;
-  private FileIO fileIO;
+  private Map<TableIdentifier, FileIO> viewFileIOByIdentifier;
   static final String ICEBERG_VIEW_TYPE_VALUE = "iceberg-view";
   static final String GLUE_VIRTUAL_VIEW_TYPE = "VIRTUAL_VIEW";
 
@@ -217,16 +218,18 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
 
     this.closeableGroup = new CloseableGroup();
     this.fileIOTracker = new FileIOTracker();
+    this.viewFileIOByIdentifier = Maps.newConcurrentMap();
     closeableGroup.addCloseable(glue);
     closeableGroup.addCloseable(lockManager);
     closeableGroup.addCloseable(metricsReporter());
     closeableGroup.addCloseable(fileIOTracker);
+    closeableGroup.addCloseable(
+        (Closeable)
+            () -> {
+              viewFileIOByIdentifier.values().forEach(FileIO::close);
+              viewFileIOByIdentifier.clear();
+            });
     closeableGroup.setSuppressCloseFailure(true);
-
-    this.fileIO =
-        GlueTableOperations.initializeFileIO(
-            catalogProperties == null ? ImmutableMap.of() : catalogProperties, hadoopConf);
-    closeableGroup.addCloseable(fileIO);
   }
 
   @Override
@@ -513,8 +516,48 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
 
   @Override
   protected ViewOperations newViewOps(TableIdentifier viewIdentifier) {
+    // FileIO initialization depends on viewSpecificCatalogProperties (e.g. the LakeFormation
+    // db/table identity), so each view gets its own FileIO. Instances are cached per view
+    // identifier: the count is bounded by the number of distinct views, repeated loads of the
+    // same view reuse the S3 client, and all instances are closed when the catalog closes.
+    FileIO viewFileIO =
+        viewFileIOByIdentifier.computeIfAbsent(
+            viewIdentifier,
+            identifier ->
+                GlueTableOperations.initializeFileIO(
+                    viewSpecificCatalogProperties(identifier), hadoopConf));
     return new GlueViewOperations(
-        glue, lockManager, catalogName, awsProperties, fileIO, viewIdentifier);
+        glue, lockManager, catalogName, awsProperties, viewFileIO, viewIdentifier);
+  }
+
+  @VisibleForTesting
+  Map<String, String> viewSpecificCatalogProperties(TableIdentifier viewIdentifier) {
+    if (catalogProperties == null) {
+      return ImmutableMap.of();
+    }
+
+    // note: S3 write-tag properties are intentionally not injected for views because views only
+    // ever write metadata JSON files
+    if (!awsProperties.glueLakeFormationEnabled()) {
+      return catalogProperties;
+    }
+
+    boolean skipNameValidation = awsProperties.glueCatalogSkipNameValidation();
+    return ImmutableMap.<String, String>builder()
+        .putAll(catalogProperties)
+        .put(
+            AwsProperties.LAKE_FORMATION_DB_NAME,
+            IcebergToGlueConverter.getDatabaseName(viewIdentifier, skipNameValidation))
+        .put(
+            AwsProperties.LAKE_FORMATION_TABLE_NAME,
+            IcebergToGlueConverter.getTableName(viewIdentifier, skipNameValidation))
+        .put(S3FileIOProperties.PRELOAD_CLIENT_ENABLED, String.valueOf(true))
+        .buildOrThrow();
+  }
+
+  @VisibleForTesting
+  Map<TableIdentifier, FileIO> viewFileIOByIdentifier() {
+    return viewFileIOByIdentifier;
   }
 
   private boolean isGlueIcebergView(Table table) {
@@ -552,8 +595,10 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
       // the Glue entry only holds a pointer to the view metadata file, so the metadata has to be
       // loaded before the entry is removed in order to be able to clean the file up afterwards
       ViewMetadata lastViewMetadata = null;
+      GlueViewOperations ops = null;
       try {
-        lastViewMetadata = newViewOps(identifier).current();
+        ops = (GlueViewOperations) newViewOps(identifier);
+        lastViewMetadata = ops.current();
       } catch (RuntimeException e) {
         LOG.warn("Failed to load view metadata for view: {}", identifier, e);
       }
@@ -567,7 +612,7 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
       LOG.info("Successfully dropped view {} from Glue", identifier);
 
       if (lastViewMetadata != null) {
-        CatalogUtil.dropViewMetadata(fileIO, lastViewMetadata);
+        CatalogUtil.dropViewMetadata(ops.io(), lastViewMetadata);
       }
 
       return true;
