@@ -516,10 +516,6 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
 
   @Override
   protected ViewOperations newViewOps(TableIdentifier viewIdentifier) {
-    // FileIO initialization depends on viewSpecificCatalogProperties (e.g. the LakeFormation
-    // db/table identity), so each view gets its own FileIO. Instances are cached per view
-    // identifier: the count is bounded by the number of distinct views, repeated loads of the
-    // same view reuse the S3 client, and all instances are closed when the catalog closes.
     FileIO viewFileIO =
         viewFileIOByIdentifier.computeIfAbsent(
             viewIdentifier,
