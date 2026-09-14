@@ -51,8 +51,6 @@ import software.amazon.awssdk.services.glue.model.ConcurrentModificationExceptio
 import software.amazon.awssdk.services.glue.model.CreateTableRequest;
 import software.amazon.awssdk.services.glue.model.DeleteTableRequest;
 import software.amazon.awssdk.services.glue.model.EntityNotFoundException;
-import software.amazon.awssdk.services.glue.model.GetTableRequest;
-import software.amazon.awssdk.services.glue.model.GetTableResponse;
 import software.amazon.awssdk.services.glue.model.StorageDescriptor;
 import software.amazon.awssdk.services.glue.model.Table;
 import software.amazon.awssdk.services.glue.model.TableInput;
@@ -284,18 +282,7 @@ class GlueTableOperations extends BaseMetastoreTableOperations {
   }
 
   private Table getGlueTable() {
-    try {
-      GetTableResponse response =
-          glue.getTable(
-              GetTableRequest.builder()
-                  .catalogId(awsProperties.glueCatalogId())
-                  .databaseName(databaseName)
-                  .name(tableName)
-                  .build());
-      return response.table();
-    } catch (EntityNotFoundException e) {
-      return null;
-    }
+    return GlueTableProbe.getTableOrNull(glue, awsProperties, databaseName, tableName);
   }
 
   private Map<String, String> prepareProperties(Table glueTable, String newMetadataLocation) {
