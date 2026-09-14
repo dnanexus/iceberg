@@ -46,8 +46,6 @@ import software.amazon.awssdk.services.glue.model.AccessDeniedException;
 import software.amazon.awssdk.services.glue.model.ConcurrentModificationException;
 import software.amazon.awssdk.services.glue.model.CreateTableRequest;
 import software.amazon.awssdk.services.glue.model.EntityNotFoundException;
-import software.amazon.awssdk.services.glue.model.GetTableRequest;
-import software.amazon.awssdk.services.glue.model.GetTableResponse;
 import software.amazon.awssdk.services.glue.model.Table;
 import software.amazon.awssdk.services.glue.model.TableInput;
 import software.amazon.awssdk.services.glue.model.UpdateTableRequest;
@@ -198,18 +196,7 @@ public class GlueViewOperations extends BaseViewOperations {
    * @return The Glue table or null if it doesn't exist
    */
   private Table getGlueTable() {
-    try {
-      GetTableResponse response =
-          glue.getTable(
-              GetTableRequest.builder()
-                  .catalogId(awsProperties.glueCatalogId())
-                  .databaseName(databaseName)
-                  .name(viewName)
-                  .build());
-      return response.table();
-    } catch (EntityNotFoundException e) {
-      return null;
-    }
+    return GlueTableProbe.getTableOrNull(glue, awsProperties, databaseName, viewName);
   }
 
   /**
