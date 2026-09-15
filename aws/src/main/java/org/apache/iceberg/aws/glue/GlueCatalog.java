@@ -372,14 +372,14 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
           IcebergToGlueConverter.getDatabaseName(
               identifier, awsProperties.glueCatalogSkipNameValidation());
 
-      GetTableResponse getTableResponse =
-          glue.getTable(
-              GetTableRequest.builder()
-                  .catalogId(awsProperties.glueCatalogId())
-                  .databaseName(databaseName)
-                  .name(identifier.name())
-                  .build());
-      if (isGlueIcebergView(getTableResponse.table())) {
+      Table glueTable =
+          GlueTableProbe.getTableOrNull(glue, awsProperties, databaseName, identifier.name());
+      if (glueTable == null) {
+        LOG.error("Cannot drop table {} because table not found or not accessible", identifier);
+        return false;
+      }
+
+      if (isGlueIcebergView(glueTable)) {
         LOG.warn("dropTable({}) called but Glue table is an iceberg-view", identifier);
         return false;
       }
@@ -574,14 +574,11 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
             identifier, awsProperties.glueCatalogSkipNameValidation());
 
     try {
-      GetTableResponse response =
-          glue.getTable(
-              GetTableRequest.builder()
-                  .catalogId(awsProperties.glueCatalogId())
-                  .databaseName(dbName)
-                  .name(tblName)
-                  .build());
-      Table glueTable = response.table();
+      Table glueTable = GlueTableProbe.getTableOrNull(glue, awsProperties, dbName, tblName);
+      if (glueTable == null) {
+        LOG.warn("Cannot dropView({}), table not found in Glue", identifier);
+        return false;
+      }
 
       if (!isGlueIcebergView(glueTable)) {
         LOG.warn("dropView({}) called but Glue table is not an iceberg-view", identifier);
@@ -760,21 +757,12 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
             identifier, awsProperties.glueCatalogSkipNameValidation());
 
     try {
-      GetTableResponse response =
-          glue.getTable(
-              GetTableRequest.builder()
-                  .catalogId(awsProperties.glueCatalogId())
-                  .databaseName(dbName)
-                  .name(tblName)
-                  .build());
-      Table glueTable = response.table();
+      Table glueTable = GlueTableProbe.getTableOrNull(glue, awsProperties, dbName, tblName);
 
       return glueTable != null
           && glueTable.parameters() != null
           && BaseMetastoreTableOperations.ICEBERG_TABLE_TYPE_VALUE.equalsIgnoreCase(
               glueTable.parameters().get(BaseMetastoreTableOperations.TABLE_TYPE_PROP));
-    } catch (EntityNotFoundException e) {
-      return false;
     } catch (RuntimeException re) {
       LOG.error("Failed to check tableExists for {}", identifier, re);
       throw re;
@@ -791,14 +779,7 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
             identifier, awsProperties.glueCatalogSkipNameValidation());
 
     try {
-      GetTableResponse response =
-          glue.getTable(
-              GetTableRequest.builder()
-                  .catalogId(awsProperties.glueCatalogId())
-                  .databaseName(dbName)
-                  .name(tblName)
-                  .build());
-      Table glueTable = response.table();
+      Table glueTable = GlueTableProbe.getTableOrNull(glue, awsProperties, dbName, tblName);
 
       return glueTable != null
           && GLUE_VIRTUAL_VIEW_TYPE.equalsIgnoreCase(glueTable.tableType())
@@ -806,8 +787,6 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
           && ICEBERG_VIEW_TYPE_VALUE.equalsIgnoreCase(
               glueTable.parameters().get(BaseMetastoreTableOperations.TABLE_TYPE_PROP));
 
-    } catch (EntityNotFoundException e) {
-      return false;
     } catch (RuntimeException re) {
       LOG.error("Failed to check viewExists for {}", identifier, re);
       throw re;
