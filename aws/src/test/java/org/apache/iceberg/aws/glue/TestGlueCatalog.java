@@ -54,10 +54,12 @@ import org.apache.iceberg.view.ViewMetadataParser;
 import org.apache.iceberg.view.ViewVersion;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 import software.amazon.awssdk.services.glue.GlueClient;
+import software.amazon.awssdk.services.glue.model.AccessDeniedException;
 import software.amazon.awssdk.services.glue.model.CreateDatabaseRequest;
 import software.amazon.awssdk.services.glue.model.CreateDatabaseResponse;
 import software.amazon.awssdk.services.glue.model.CreateTableRequest;
@@ -1095,6 +1097,104 @@ public class TestGlueCatalog {
     Mockito.verify(glue, Mockito.never())
         .deleteTable(Mockito.argThat((DeleteTableRequest r) -> r.name().equals("renamed_view")));
     assertThat(io.fileExists(metadataLocation)).isTrue();
+  }
+
+  /**
+   * A cross-account {@code glue:GetTable} is authorized before the table name is resolved, so for a
+   * name that does not exist Glue answers with {@link AccessDeniedException} rather than {@link
+   * EntityNotFoundException}. With Lake Formation enabled that denial has to read as "not found",
+   * otherwise no client can ever probe for a table it is about to create.
+   */
+  @Test
+  public void testAccessDeniedReadsAsNotFoundWithLakeFormation() {
+    Mockito.doThrow(accessDeniedOnGetTable())
+        .when(glue)
+        .getTable(Mockito.any(GetTableRequest.class));
+
+    GlueCatalog catalog = lakeFormationCatalog(null);
+    assertThat(catalog.tableExists(TableIdentifier.of("db", "missing"))).isFalse();
+    assertThat(catalog.viewExists(TableIdentifier.of("db", "missing"))).isFalse();
+    assertThat(catalog.dropTable(TableIdentifier.of("db", "missing"), false)).isFalse();
+    assertThat(catalog.dropView(TableIdentifier.of("db", "missing"))).isFalse();
+    assertThat(catalog.newTableOps(TableIdentifier.of("db", "missing")).current()).isNull();
+  }
+
+  @Test
+  public void testAccessDeniedIsPropagatedWithoutLakeFormation() {
+    Mockito.doThrow(accessDeniedOnGetTable())
+        .when(glue)
+        .getTable(Mockito.any(GetTableRequest.class));
+
+    TableIdentifier identifier = TableIdentifier.of("db", "missing");
+    assertThatThrownBy(() -> glueCatalog.tableExists(identifier))
+        .isInstanceOf(AccessDeniedException.class)
+        .hasMessageContaining("no resource-based policy allows the glue:GetTable action");
+    assertThatThrownBy(() -> glueCatalog.viewExists(identifier))
+        .isInstanceOf(AccessDeniedException.class)
+        .hasMessageContaining("no resource-based policy allows the glue:GetTable action");
+  }
+
+  /**
+   * The create flow this behavior exists for: the existence probe is denied for the whole duration
+   * of the create, and the table is still created. The Lake Formation temporary table stands in for
+   * the table being created, so it has to be created in the catalog that will hold the real table
+   * rather than in the caller's own catalog.
+   */
+  @Test
+  public void testCreateTableWithLakeFormationWhileProbeIsDenied() {
+    Mockito.doThrow(accessDeniedOnGetTable())
+        .when(glue)
+        .getTable(Mockito.any(GetTableRequest.class));
+    Mockito.doReturn(
+            GetDatabaseResponse.builder().database(Database.builder().name("db").build()).build())
+        .when(glue)
+        .getDatabase(Mockito.any(GetDatabaseRequest.class));
+    Mockito.doReturn(CreateTableResponse.builder().build())
+        .when(glue)
+        .createTable(Mockito.any(CreateTableRequest.class));
+
+    lakeFormationCatalog("210987654321")
+        .createTable(
+            TableIdentifier.of("db", "new_table"),
+            new Schema(Types.NestedField.required(1, "id", Types.LongType.get())));
+
+    ArgumentCaptor<CreateTableRequest> captor = ArgumentCaptor.forClass(CreateTableRequest.class);
+    Mockito.verify(glue, Mockito.atLeast(2)).createTable(captor.capture());
+    assertThat(captor.getAllValues())
+        .as("Both the Lake Formation temp table and the real table must name the shared catalog")
+        .allSatisfy(request -> assertThat(request.catalogId()).isEqualTo("210987654321"));
+    assertThat(captor.getValue().tableInput().parameters())
+        .containsKey(BaseMetastoreTableOperations.METADATA_LOCATION_PROP);
+  }
+
+  private static AccessDeniedException accessDeniedOnGetTable() {
+    return AccessDeniedException.builder()
+        .message(
+            "User: arn:aws:sts::123456789012:assumed-role/role/session is not authorized to "
+                + "perform: glue:GetTable on resource: arn:aws:glue:us-east-1:210987654321:"
+                + "table/db/missing because no resource-based policy allows the glue:GetTable "
+                + "action")
+        .build();
+  }
+
+  private GlueCatalog lakeFormationCatalog(String glueCatalogId) {
+    ImmutableMap.Builder<String, String> properties =
+        ImmutableMap.<String, String>builder()
+            .put(AwsProperties.GLUE_LAKEFORMATION_ENABLED, "true");
+    if (glueCatalogId != null) {
+      properties.put(AwsProperties.GLUE_CATALOG_ID, glueCatalogId);
+    }
+
+    GlueCatalog catalog = new GlueCatalog();
+    catalog.initialize(
+        CATALOG_NAME,
+        WAREHOUSE_PATH,
+        new AwsProperties(properties.buildOrThrow()),
+        new S3FileIOProperties(),
+        glue,
+        LockManagers.defaultLockManager(),
+        ImmutableMap.of(CatalogProperties.FILE_IO_IMPL, InMemoryFileIO.class.getName()));
+    return catalog;
   }
 
   private GlueCatalog glueCatalogWithInMemoryFileIO() {
