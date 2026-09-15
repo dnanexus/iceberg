@@ -32,6 +32,7 @@ import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NoSuchViewException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.view.BaseViewOperations;
@@ -45,7 +46,9 @@ import software.amazon.awssdk.services.glue.GlueClient;
 import software.amazon.awssdk.services.glue.model.AccessDeniedException;
 import software.amazon.awssdk.services.glue.model.ConcurrentModificationException;
 import software.amazon.awssdk.services.glue.model.CreateTableRequest;
+import software.amazon.awssdk.services.glue.model.DeleteTableRequest;
 import software.amazon.awssdk.services.glue.model.EntityNotFoundException;
+import software.amazon.awssdk.services.glue.model.StorageDescriptor;
 import software.amazon.awssdk.services.glue.model.Table;
 import software.amazon.awssdk.services.glue.model.TableInput;
 import software.amazon.awssdk.services.glue.model.UpdateTableRequest;
@@ -130,11 +133,15 @@ public class GlueViewOperations extends BaseViewOperations {
 
   @Override
   protected void doCommit(ViewMetadata base, ViewMetadata metadata) {
-    String newMetadataLocation = writeNewMetadataIfRequired(metadata);
+    String newMetadataLocation = null;
     CommitStatus commitStatus = CommitStatus.FAILURE;
     RetryDetector retryDetector = new RetryDetector();
+    boolean glueTempViewCreated = false;
 
     try {
+      glueTempViewCreated = createGlueTempViewIfNecessary(base, metadata);
+      newMetadataLocation = writeNewMetadataIfRequired(metadata);
+
       if (lockManager != null) {
         // Acquire a lock if needed
         if (!lockManager.acquire(commitLockEntityId, newMetadataLocation)) {
@@ -183,9 +190,67 @@ public class GlueViewOperations extends BaseViewOperations {
       } catch (RuntimeException e) {
         LOG.error("Failed to clean up metadata location: {}", newMetadataLocation, e);
       } finally {
+        cleanupGlueTempViewIfNecessary(glueTempViewCreated, commitStatus);
         if (lockManager != null) {
           lockManager.release(commitLockEntityId, newMetadataLocation);
         }
+      }
+    }
+  }
+
+  /**
+   * Create a placeholder Glue entry for a view that is about to be created.
+   *
+   * <p>Lake Formation vends credentials for a table ARN, so the entry a view's metadata file is
+   * written under has to exist before that file can be written. The placeholder deliberately
+   * carries no metadata location, so the commit that follows sees it as a view whose metadata has
+   * not been published yet and updates it in place.
+   *
+   * @param base the base view metadata, null when the view is being created
+   * @param metadata the view metadata being committed
+   * @return true if a placeholder entry was created and has to be cleaned up on failure
+   */
+  private boolean createGlueTempViewIfNecessary(ViewMetadata base, ViewMetadata metadata) {
+    if (!awsProperties.glueLakeFormationEnabled() || base != null) {
+      return false;
+    }
+
+    LOG.debug("Creating Lake Formation placeholder Glue view: {}", fullViewName);
+    String sqlText = extractSqlText(metadata);
+    glue.createTable(
+        CreateTableRequest.builder()
+            .catalogId(awsProperties.glueCatalogId())
+            .databaseName(databaseName)
+            .tableInput(
+                TableInput.builder()
+                    .name(viewName)
+                    .tableType(GlueCatalog.GLUE_VIRTUAL_VIEW_TYPE)
+                    .parameters(
+                        ImmutableMap.of(
+                            BaseMetastoreTableOperations.TABLE_TYPE_PROP,
+                            GlueCatalog.ICEBERG_VIEW_TYPE_VALUE))
+                    .storageDescriptor(
+                        StorageDescriptor.builder().location(metadata.location()).build())
+                    .viewOriginalText(sqlText)
+                    .viewExpandedText(sqlText)
+                    .build())
+            .build());
+    return true;
+  }
+
+  private void cleanupGlueTempViewIfNecessary(
+      boolean glueTempViewCreated, CommitStatus commitStatus) {
+    if (glueTempViewCreated && commitStatus != CommitStatus.SUCCESS) {
+      LOG.debug("Removing Lake Formation placeholder Glue view: {}", fullViewName);
+      try {
+        glue.deleteTable(
+            DeleteTableRequest.builder()
+                .catalogId(awsProperties.glueCatalogId())
+                .databaseName(databaseName)
+                .name(viewName)
+                .build());
+      } catch (RuntimeException e) {
+        LOG.error("Failed to remove Lake Formation placeholder Glue view: {}", fullViewName, e);
       }
     }
   }

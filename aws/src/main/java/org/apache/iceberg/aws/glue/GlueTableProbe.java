@@ -19,8 +19,6 @@
 package org.apache.iceberg.aws.glue;
 
 import org.apache.iceberg.aws.AwsProperties;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.services.glue.GlueClient;
 import software.amazon.awssdk.services.glue.model.AccessDeniedException;
 import software.amazon.awssdk.services.glue.model.EntityNotFoundException;
@@ -29,15 +27,12 @@ import software.amazon.awssdk.services.glue.model.Table;
 
 /**
  * Existence probe for Glue tables and views that understands Lake Formation and with few
- * cross-account specialities.
- * In case of Lake Formation, it can happen that `glue:GetTable` call will not pass and
- * reject with `AccessDeniedException`. For cross-account configuration this is expected
- * behavior and the commands like `CREATE TABLE IF NOT EXISTS` in such setup cannot
- * probe easily.
+ * cross-account specialities. In case of Lake Formation, it can happen that `glue:GetTable` call
+ * will not pass and reject with `AccessDeniedException`. For cross-account configuration this is
+ * expected behavior and the commands like `CREATE TABLE IF NOT EXISTS` in such setup cannot probe
+ * easily.
  */
 class GlueTableProbe {
-
-  private static final Logger LOG = LoggerFactory.getLogger(GlueTableProbe.class);
 
   private GlueTableProbe() {}
 
