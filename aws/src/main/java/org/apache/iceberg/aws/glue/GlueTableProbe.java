@@ -28,16 +28,12 @@ import software.amazon.awssdk.services.glue.model.GetTableRequest;
 import software.amazon.awssdk.services.glue.model.Table;
 
 /**
- * Existence probe for Glue tables and views that understands cross-account Lake Formation
- * semantics.
- *
- * <p>A cross-account {@code glue:GetTable} request is authorized before the table name is resolved,
- * and that pre-resolution check can only be satisfied by a Glue Data Catalog resource policy in the
- * owning account. Lake Formation grants apply to resources that exist, so for a name that does not
- * exist yet no grant can satisfy the check and Glue returns {@link AccessDeniedException} instead
- * of {@link EntityNotFoundException}. When {@link AwsProperties#GLUE_LAKEFORMATION_ENABLED} is set,
- * that denial is therefore treated as "not found" so the probe-then-create flow works without a
- * resource policy.
+ * Existence probe for Glue tables and views that understands Lake Formation and with few
+ * cross-account specialities.
+ * In case of Lake Formation, it can happen that `glue:GetTable` call will not pass and
+ * reject with `AccessDeniedException`. For cross-account configuration this is expected
+ * behavior and the commands like `CREATE TABLE IF NOT EXISTS` in such setup cannot
+ * probe easily.
  */
 class GlueTableProbe {
 
@@ -73,14 +69,6 @@ class GlueTableProbe {
         throw e;
       }
 
-      LOG.warn(
-          "Treating access denied while looking up Glue table {}.{} as not found because {} is "
-              + "enabled: cross-account Lake Formation denies glue:GetTable for names that do not "
-              + "exist instead of reporting them as missing",
-          databaseName,
-          tableName,
-          AwsProperties.GLUE_LAKEFORMATION_ENABLED,
-          e);
       return null;
     }
   }
