@@ -36,6 +36,7 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.inmemory.InMemoryFileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.types.Types;
@@ -44,12 +45,15 @@ import org.apache.iceberg.view.ViewMetadata;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mockito;
 import software.amazon.awssdk.services.glue.GlueClient;
+import software.amazon.awssdk.services.glue.model.AccessDeniedException;
 import software.amazon.awssdk.services.glue.model.ConcurrentModificationException;
 import software.amazon.awssdk.services.glue.model.CreateTableRequest;
 import software.amazon.awssdk.services.glue.model.CreateTableResponse;
 import software.amazon.awssdk.services.glue.model.Database;
+import software.amazon.awssdk.services.glue.model.DeleteTableRequest;
 import software.amazon.awssdk.services.glue.model.EntityNotFoundException;
 import software.amazon.awssdk.services.glue.model.GetDatabaseRequest;
 import software.amazon.awssdk.services.glue.model.GetDatabaseResponse;
@@ -72,6 +76,10 @@ public class TestGlueViewCommitFailure {
   private static final String WAREHOUSE_PATH = "s3://bucket";
   private static final String DATABASE_NAME = "db";
   private static final String VIEW_NAME = "view";
+
+  /** Stands in for the producing account that owns the shared database. */
+  private static final String GLUE_CATALOG_ID = "210987654321";
+
   private static final TableIdentifier VIEW_IDENTIFIER =
       TableIdentifier.of(DATABASE_NAME, VIEW_NAME);
   private static final Schema SCHEMA =
@@ -292,6 +300,82 @@ public class TestGlueViewCommitFailure {
     assertThat(fileIO(ops).fileExists(newMetadataLocation))
         .as("Commit outcome is unknown, so the new metadata file must not be deleted")
         .isTrue();
+  }
+
+  @Test
+  public void testLakeFormationCreateViewPublishesThroughAPlaceholderEntry() {
+    lakeFormationCatalog()
+        .buildView(VIEW_IDENTIFIER)
+        .withSchema(SCHEMA)
+        .withDefaultNamespace(Namespace.of(DATABASE_NAME))
+        .withQuery("spark", "select id from db.tbl")
+        .create();
+
+    InOrder inOrder = Mockito.inOrder(glue);
+    ArgumentCaptor<CreateTableRequest> placeholder =
+        ArgumentCaptor.forClass(CreateTableRequest.class);
+    inOrder.verify(glue).createTable(placeholder.capture());
+    ArgumentCaptor<UpdateTableRequest> published =
+        ArgumentCaptor.forClass(UpdateTableRequest.class);
+    inOrder.verify(glue).updateTable(published.capture());
+
+    TableInput placeholderInput = placeholder.getValue().tableInput();
+    assertThat(placeholder.getValue().catalogId()).isEqualTo(GLUE_CATALOG_ID);
+    assertThat(placeholderInput.tableType()).isEqualTo("VIRTUAL_VIEW");
+    assertThat(placeholderInput.storageDescriptor().location()).isNotBlank();
+    assertThat(placeholderInput.parameters())
+        .containsEntry(BaseMetastoreTableOperations.TABLE_TYPE_PROP, "iceberg-view")
+        .doesNotContainKey(BaseMetastoreTableOperations.METADATA_LOCATION_PROP);
+
+    assertThat(published.getValue().catalogId()).isEqualTo(GLUE_CATALOG_ID);
+    assertThat(published.getValue().tableInput().parameters())
+        .containsKey(BaseMetastoreTableOperations.METADATA_LOCATION_PROP);
+  }
+
+  @Test
+  public void testLakeFormationPlaceholderEntryIsRemovedWhenTheCommitFails() {
+    Mockito.doThrow(
+            AccessDeniedException.builder()
+                .message("not authorized to perform: glue:UpdateTable")
+                .build())
+        .when(glue)
+        .updateTable(Mockito.any(UpdateTableRequest.class));
+
+    assertThatThrownBy(
+            () ->
+                lakeFormationCatalog()
+                    .buildView(VIEW_IDENTIFIER)
+                    .withSchema(SCHEMA)
+                    .withDefaultNamespace(Namespace.of(DATABASE_NAME))
+                    .withQuery("spark", "select id from db.tbl")
+                    .create())
+        .isInstanceOf(ValidationException.class)
+        .hasMessageContaining("insufficient permissions");
+
+    ArgumentCaptor<DeleteTableRequest> captor = ArgumentCaptor.forClass(DeleteTableRequest.class);
+    Mockito.verify(glue).deleteTable(captor.capture());
+    assertThat(captor.getValue().catalogId())
+        .as("The placeholder has to be removed from the catalog it was created in")
+        .isEqualTo(GLUE_CATALOG_ID);
+    assertThat(captor.getValue().name()).isEqualTo(VIEW_NAME);
+  }
+
+  private GlueCatalog lakeFormationCatalog() {
+    GlueCatalog catalog = new GlueCatalog();
+    catalog.initialize(
+        CATALOG_NAME,
+        WAREHOUSE_PATH,
+        new AwsProperties(
+            ImmutableMap.of(
+                AwsProperties.GLUE_LAKEFORMATION_ENABLED,
+                "true",
+                AwsProperties.GLUE_CATALOG_ID,
+                GLUE_CATALOG_ID)),
+        new S3FileIOProperties(),
+        glue,
+        LockManagers.defaultLockManager(),
+        ImmutableMap.of(CatalogProperties.FILE_IO_IMPL, InMemoryFileIO.class.getName()));
+    return catalog;
   }
 
   private GlueViewOperations createView() {
