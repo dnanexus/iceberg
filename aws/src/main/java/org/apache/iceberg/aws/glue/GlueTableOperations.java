@@ -238,6 +238,7 @@ class GlueTableOperations extends BaseMetastoreTableOperations {
       // beforehand for create table scenario
       glue.createTable(
           CreateTableRequest.builder()
+              .catalogId(awsProperties.glueCatalogId())
               .databaseName(databaseName)
               .tableInput(
                   TableInput.builder()
@@ -257,7 +258,11 @@ class GlueTableOperations extends BaseMetastoreTableOperations {
       boolean glueTempTableCreated, CommitStatus commitStatus) {
     if (glueTempTableCreated && commitStatus != CommitStatus.SUCCESS) {
       glue.deleteTable(
-          DeleteTableRequest.builder().databaseName(databaseName).name(tableName).build());
+          DeleteTableRequest.builder()
+              .catalogId(awsProperties.glueCatalogId())
+              .databaseName(databaseName)
+              .name(tableName)
+              .build());
     }
   }
 
